@@ -57,19 +57,79 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) {
+    ) -> bool {
         self.push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
-        );
+        )
     }
-    fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
+    fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) -> bool {
+        for area in self.areas.iter() {
+            if (area.data_frames.range(map_area.vpn_range.get_start()..map_area.vpn_range.get_end())).next().is_some() {
+                return false;
+            }
+        }
         map_area.map(&mut self.page_table);
         if let Some(data) = data {
             map_area.copy_data(&mut self.page_table, data);
         }
         self.areas.push(map_area);
+        true
     }
+
+    /// Delete a map area from the current 'Running' task's page table
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        
+        let area_idx = if let Some((idx, _)) = self.areas.iter()
+        .enumerate()
+        .find(|(_, area)| area.vpn_range.get_start() <= start_vpn && 
+                         area.vpn_range.get_end() >= end_vpn &&
+                         area.map_type == MapType::Framed) {
+            idx
+        } else {
+            return false;
+        };
+        let mut original_area = self.areas.remove(area_idx);
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            original_area.unmap_one(&mut self.page_table, vpn);
+        }
+
+        if original_area.vpn_range.get_start() < start_vpn {
+            let mut front_area = MapArea::new(
+                original_area.vpn_range.get_start().into(),
+                start_vpn.into(),
+                original_area.map_type,
+                original_area.map_perm,
+            );
+
+            for vpn in VPNRange::new(original_area.vpn_range.get_start(), start_vpn) {
+                if let Some(frame) = original_area.data_frames.remove(&vpn) {
+                    front_area.data_frames.insert(vpn, frame);
+                }
+            }
+            self.areas.push(front_area);
+        }
+
+        if original_area.vpn_range.get_end() > end_vpn {
+            let mut back_area = MapArea::new(
+                end_vpn.into(),
+                original_area.vpn_range.get_end().into(),
+                original_area.map_type,
+                original_area.map_perm,
+            );
+            // 移动对应范围的页帧
+            for vpn in VPNRange::new(end_vpn, original_area.vpn_range.get_end()) {
+                if let Some(frame) = original_area.data_frames.remove(&vpn) {
+                    back_area.data_frames.insert(vpn, frame);
+                }
+            }
+            self.areas.push(back_area);
+        }
+        return true;
+    }
+
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -272,6 +332,7 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    /// Create a new map area
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -287,21 +348,28 @@ impl MapArea {
             map_perm,
         }
     }
-    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+    /// Map a virtual page number to a physical page number
+    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
         let ppn: PhysPageNum;
         match self.map_type {
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
             }
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc();
+                if frame.is_none() {
+                    return false;
+                }
+                let frame = frame.unwrap();
                 ppn = frame.ppn;
                 self.data_frames.insert(vpn, frame);
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
+        true
     }
+    /// Unmap a virtual page number
     #[allow(unused)]
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
@@ -309,17 +377,20 @@ impl MapArea {
         }
         page_table.unmap(vpn);
     }
+    /// Map all virtual page numbers in the range
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
+    /// Unmap all virtual page numbers in the range
     #[allow(unused)]
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
     }
+    /// Shrink the range to the new end
     #[allow(unused)]
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
@@ -327,12 +398,16 @@ impl MapArea {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
+    /// Append the range to the new end
     #[allow(unused)]
-    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) -> bool {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
-            self.map_one(page_table, vpn)
+            if !self.map_one(page_table, vpn) {
+                return false;
+            }
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        true
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
@@ -361,7 +436,9 @@ impl MapArea {
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
 pub enum MapType {
+    /// Identical mapping
     Identical,
+    /// Framed mapping
     Framed,
 }
 

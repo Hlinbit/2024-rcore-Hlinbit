@@ -21,9 +21,12 @@ use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
+pub use crate::mm::{PageTable, VirtAddr, PhysAddr, translate_user_vaddr};
+use crate::timer::get_time_ms;
 
 pub use context::TaskContext;
-
+use crate::syscall::TaskInfo;
+use crate::mm::MapPermission;
 /// The task manager, where all the tasks are managed.
 ///
 /// Functions implemented on `TaskManager` deals with all task state transitions
@@ -79,6 +82,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        next_task.time = get_time_ms();
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -141,6 +145,9 @@ impl TaskManager {
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
+            if inner.tasks[next].time == 0 {
+                inner.tasks[next].time = get_time_ms();
+            }
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
             drop(inner);
@@ -152,6 +159,13 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Record a system call
+    pub fn record_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].system_calls[syscall_id] += 1;
     }
 }
 
@@ -201,4 +215,50 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Convert a user-space virtual address to its physical address
+pub fn translate_user_addr(vaddr: VirtAddr) -> Option<usize> {
+    // Get the current process's token (root page table physical address stored in satp register)
+    let token = current_user_token();
+    // Try to translate virtual address to physical address
+    translate_user_vaddr(token, vaddr.into())
+}
+
+/// Add a map area to the current 'Running' task's page table
+pub fn add_memery_map_to_pagetable(start_va: usize, end_va: usize, permission: MapPermission) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    let start_va = VirtAddr::from(start_va);
+    let end_va = VirtAddr::from(end_va);
+    if inner.tasks[cur].memory_set.insert_framed_area(start_va, end_va, permission) {
+        return true;
+    }
+    false
+}
+
+/// Delete a map area from the current 'Running' task's page table
+pub fn del_memery_map_to_pagetable(start_va: usize, end_va: usize) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    if inner.tasks[cur].memory_set.remove_framed_area(VirtAddr::from(start_va), VirtAddr::from(end_va)) {
+        return true;
+    }
+    false
+}
+
+/// Record a system call
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_syscall(syscall_id);
+}
+
+/// Get the current 'Running' task's information
+pub fn get_current_task_info() -> TaskInfo {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    TaskInfo {
+        status: inner.tasks[current].task_status,
+        syscall_times: inner.tasks[current].system_calls,
+        time: get_time_ms() - inner.tasks[current].time,
+    }
 }
