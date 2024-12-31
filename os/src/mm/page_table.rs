@@ -213,3 +213,20 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .unwrap()
         .get_mut()
 }
+
+/// Translate a user virtual address to its corresponding physical address
+pub fn translate_user_vaddr(token: usize, vaddr: usize) -> Option<usize> {
+    let page_table = PageTable::from_token(token);
+    let virt_addr = VirtAddr::from(vaddr);
+    
+    // Get the page number and offset
+    let vpn = virt_addr.floor();
+    let offset = virt_addr.page_offset();
+    
+    // Try to get the physical page number through page table
+    page_table.translate(vpn).map(|pte| {
+        let ppn = pte.ppn();
+        // Calculate final physical address: physical page number + offset
+        ppn.0 << 12 | offset
+    })
+}

@@ -27,7 +27,9 @@ use lazy_static::*;
 pub use manager::{fetch_task, TaskManager};
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
+pub use crate::mm::{MapPermission, VirtAddr, PhysAddr, translate_user_vaddr};
+use crate::timer::get_time_ms;
+use crate::syscall::TaskInfo;
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 pub use manager::add_task;
@@ -114,4 +116,52 @@ lazy_static! {
 ///Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
+}
+
+/// Convert a user-space virtual address to its physical address
+pub fn translate_user_addr(vaddr: VirtAddr) -> Option<usize> {
+    // Get the current process's token (root page table physical address stored in satp register)
+    let token = current_user_token();
+    // Try to translate virtual address to physical address
+    translate_user_vaddr(token, vaddr.into())
+}
+
+/// Add a map area to the current 'Running' task's page table
+pub fn add_memery_map_to_pagetable(start_va: usize, end_va: usize, permission: MapPermission) -> bool {
+    let task = take_current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let start_va = VirtAddr::from(start_va);
+    let end_va = VirtAddr::from(end_va);
+    if inner.memory_set.insert_framed_area(start_va, end_va, permission) {
+        return true;
+    }
+    false
+}
+
+/// Delete a map area from the current 'Running' task's page table
+pub fn del_memery_map_to_pagetable(start_va: usize, end_va: usize) -> bool {
+    let task = take_current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.remove_framed_area(VirtAddr::from(start_va), VirtAddr::from(end_va)) {
+        return true;
+    }
+    false
+}
+
+/// Record a system call
+pub fn record_syscall(syscall_id: usize) {
+    let task = take_current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.system_calls[syscall_id] += 1;
+}
+
+/// Get the current 'Running' task's information
+pub fn get_current_task_info() -> TaskInfo {
+    let task = take_current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    TaskInfo {
+        status: inner.task_status,
+        syscall_times: inner.system_calls,
+        time: get_time_ms() - inner.time,
+    }
 }

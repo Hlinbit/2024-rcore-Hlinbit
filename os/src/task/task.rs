@@ -12,6 +12,8 @@ use core::cell::RefMut;
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
+use crate::config::MAX_SYSCALL_NUM;
+/// The task control block (TCB) of a task.
 pub struct TaskControlBlock {
     // Immutable
     /// Process identifier
@@ -68,6 +70,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// System calls
+    pub system_calls: [u32; MAX_SYSCALL_NUM],
+
+    /// execution time
+    pub time: usize,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +126,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    system_calls: [0; MAX_SYSCALL_NUM],
+                    time: 0,
                 })
             },
         };
@@ -191,6 +201,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    system_calls: [0; MAX_SYSCALL_NUM],
+                    time: 0,
                 })
             },
         });
